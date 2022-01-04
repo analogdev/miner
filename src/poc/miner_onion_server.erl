@@ -248,6 +248,8 @@ send_witness(Data, OnionCompactKey, Time, RSSI, SNR, Frequency, Channel, DataRat
                                                [RSSI, Frequency, SNR]),
                                     send_witness(Data, OnionCompactKey, Time, RSSI, SNR, Frequency, Channel, DataRate, State, Retry-1);
                                 {ok, Stream} ->
+                                    lager:info("successfully sent witness to challenger ~p with RSSI: ~p, Frequency: ~p, SNR: ~p",
+                                                  [P2P, RSSI, Frequency, SNR]),
                                     _ = miner_poc_handler:send(Stream, EncodedWitness)
                             end
                     end
@@ -448,30 +450,30 @@ decrypt(Type, IV, OnionCompactKey, Tag, CipherText, RSSI, SNR, Frequency, Channe
             end,
             State;
         {error, Reason} ->
-            lager:info([{poc_id, POCID}], "could not decrypt packet received via ~p: Reason, discarding", [Type, Reason]),
+            lager:info([{poc_id, POCID}], "could not decrypt packet received via ~p: ~p, discarding", [Type, Reason]),
             State
     end,
     NewState.
 
 -spec try_decrypt(binary(), binary(), binary(), binary(), binary(), function(), blockchain:blockchain()) -> poc_not_found | {ok, binary(), binary()} | {error, any()}.
 try_decrypt(IV, OnionCompactKey, OnionKeyHash, Tag, CipherText, ECDHFun, Chain) ->
+    POCID = blockchain_utils:poc_id(OnionCompactKey),
     Ledger = blockchain:ledger(Chain),
     case blockchain_ledger_v1:find_poc(OnionKeyHash, Ledger) of
         {error, not_found} ->
             poc_not_found;
-        {ok, [PoC]} ->
-            Blockhash = blockchain_ledger_poc_v2:block_hash(PoC),
+        {ok, PoC} ->
+            lager:info([{poc_id, POCID}], "found poc. attempting to decrypt", []),
+            Blockhash = blockchain_ledger_poc_v3:block_hash(PoC),
             try blockchain_poc_packet:decrypt(<<IV/binary, OnionCompactKey/binary, Tag/binary, CipherText/binary>>, ECDHFun, Blockhash, Ledger) of
                 error ->
                     {error, fail_decrypt};
                 {Payload, NextLayer} ->
                     {ok, Payload, NextLayer}
-            catch _A:_B ->
-                    {error, {_A, _B}}
-            end;
-        {ok, _} ->
-            %% TODO we might want to try all the PoCs here
-            {error, too_many_pocs}
+            catch C:E:S ->
+                    lager:warning([{poc_id, POCID}], "crash during decrypt ~p:~p ~p", [C, E, S]),
+                    {error, {C, E}}
+            end
     end.
 
 -spec tx_power(Region :: atom(), State :: state()) -> {ok, pos_integer(), pos_integer(), non_neg_integer()} | {error, any()}.
