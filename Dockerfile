@@ -5,13 +5,11 @@ FROM ${BUILDER_IMAGE} as deps-compiler
 ARG REBAR_DIAGNOSTIC=0
 ENV DIAGNOSTIC=${REBAR_DIAGNOSTIC}
 
-ARG VERSION
-# default to building for mainnet
-ARG BUILD_NET=mainnet
-ARG DIAGNOSTIC=1
 ARG REBAR_BUILD_TARGET
 ARG TAR_PATH=_build/$REBAR_BUILD_TARGET/rel/*/*.tar.gz
 ARG EXTRA_BUILD_APK_PACKAGES
+
+ARG NETWORK=mainnet
 
 RUN apk add --no-cache --update \
     git tar build-base linux-headers autoconf automake libtool pkgconfig \
