@@ -1,6 +1,6 @@
-ARG BUILDER_IMAGE=erlang:24-alpine
+ARG BUILDER_IMAGE=erlang:23.3.4.6-alpine
 ARG RUNNER_IMAGE=alpine
-FROM ${BUILDER_IMAGE} as builder
+FROM ${BUILDER_IMAGE} as deps-compiler
 
 ARG REBAR_DIAGNOSTIC=0
 ENV DIAGNOSTIC=${REBAR_DIAGNOSTIC}
@@ -30,12 +30,27 @@ ENV CC=gcc CXX=g++ CFLAGS="-U__sun__" \
     PATH="/root/.cargo/bin:$PATH" \
     RUSTFLAGS="-C target-feature=-crt-static"
 
-# Add our code
-ADD . /usr/src/miner/
-ADD config/grpc_client_gen.config config/grpc_client_gen.config
+# Add and compile the dependencies to cache
+COPY ./rebar* ./Makefile ./
+COPY ./config/grpc_client_gen.config ./config/
 
-RUN ./rebar3 as ${REBAR_BUILD_TARGET} tar -n miner -v ${VERSION}; exit 0
-RUN ./rebar3 as ${REBAR_BUILD_TARGET} tar -n miner -v ${VERSION}
+RUN ./rebar3 compile
+
+FROM deps-compiler as builder
+
+ARG VERSION
+ARG REBAR_DIAGNOSTIC=0
+# default to building for mainnet
+ARG BUILD_NET=mainnet
+ENV DIAGNOSTIC=${REBAR_DIAGNOSTIC}
+
+ARG REBAR_BUILD_TARGET
+ARG TAR_PATH=_build/$REBAR_BUILD_TARGET/rel/*/*.tar.gz
+
+# Now add our code
+COPY . .
+
+RUN ./rebar3 as ${REBAR_BUILD_TARGET} tar -n miner -v ${VERSION};
 
 RUN mkdir -p /opt/docker/update
 RUN tar -zxvf ${TAR_PATH} -C /opt/docker
