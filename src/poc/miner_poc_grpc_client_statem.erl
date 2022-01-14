@@ -15,6 +15,7 @@
 %% ------------------------------------------------------------------
 -export([
     start_link/0,
+    stop/0,
     connection/0,
     check_target/6,
     send_report/3,
@@ -75,6 +76,10 @@
 start_link() ->
     gen_statem:start_link({local, ?MODULE}, ?MODULE, [], []).
 
+-spec stop() -> ok.
+stop() ->
+    gen_statem:stop(?MODULE).
+
 -spec connection() -> {ok, grpc_client_custom:connection()}.
 connection() ->
     gen_statem:call(?MODULE, connection, infinity).
@@ -108,6 +113,7 @@ update_config(UpdatedKeys)->
 %% ------------------------------------------------------------------
 init(_Args) ->
     lager:info("starting ~p", [?MODULE]),
+    erlang:process_flag(trap_exit, true),
     SelfPubKeyBin = blockchain_swarm:pubkey_bin(),
     {ok, _, SigFun, _} = blockchain_swarm:keys(),
     {ok, setup, #data{self_pub_key_bin = SelfPubKeyBin, self_sig_fun = SigFun}}.
@@ -115,7 +121,8 @@ init(_Args) ->
 callback_mode() -> [state_functions,state_enter].
 
 terminate(_Reason, Data) ->
-    ok = disconnect(Data),
+    lager:info("terminating with reason ~p", [_Reason]),
+    _ = disconnect(Data),
     ok.
 
 %% ------------------------------------------------------------------
