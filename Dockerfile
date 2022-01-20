@@ -1,4 +1,4 @@
-ARG BUILDER_IMAGE=erlang:23.3.4.6-alpine
+ARG BUILDER_IMAGE=erlang:24-alpine
 ARG RUNNER_IMAGE=alpine
 FROM ${BUILDER_IMAGE} as deps-compiler
 
@@ -48,7 +48,7 @@ ARG TAR_PATH=_build/$REBAR_BUILD_TARGET/rel/*/*.tar.gz
 # Now add our code
 COPY . .
 
-RUN ./rebar3 as ${REBAR_BUILD_TARGET} tar -n miner -v ${VERSION};
+RUN ./rebar3 as ${REBAR_BUILD_TARGET} tar -n miner -v ${VERSION}
 
 RUN mkdir -p /opt/docker/update
 RUN tar -zxvf ${TAR_PATH} -C /opt/docker
