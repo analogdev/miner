@@ -15,6 +15,7 @@
 -define(ACTIVE_POCS, active_pocs).
 -define(KEYS, keys).
 -define(ADDR_HASH_FP_RATE, 1.0e-9).
+-define(POC_DB_CF, {?MODULE, poc_db_cf_handle}).
 -ifdef(TEST).
 %% lifespan of a POC, after which we will
 %% submit the receipts txn and delete the local poc data
@@ -84,7 +85,8 @@
     sig_fun :: undefined | libp2p_crypto:sig_fun(),
     pub_key = undefined :: undefined | libp2p_crypto:pubkey_bin(),
     addr_hash_filter :: undefined | #addr_hash_filter{},
-    poc_timeout :: pos_integer()
+    poc_timeout :: pos_integer() | undefined,
+    poc_receipts_absorb_timeout :: pos_integer() | undefined
 }).
 -type state() :: #state{}.
 -type keys() :: #{secret => libp2p_crypto:privkey(), public => libp2p_crypto:pubkey()}.
@@ -166,10 +168,6 @@ cached_poc_key(ID) ->
 active_pocs() ->
     gen_server:call(?MODULE, {active_pocs}).
 
--spec local_poc(binary()) -> {ok, local_poc()} | {error, any()}.
-local_poc(OnionKeyHash) ->
-    gen_server:call(?MODULE, {local_poc, OnionKeyHash}).
-
 -spec check_target(
     Challengee :: libp2p_crypto:pubkey_bin(),
     BlockHash :: binary(),
@@ -180,30 +178,55 @@ check_target(Challengee, BlockHash, OnionKeyHash) ->
     LocalPOC = e2qc:cache(
                 local_pocs,
                 OnionKeyHash,
-                60,
+                30,
                 fun() -> ?MODULE:local_poc(OnionKeyHash) end
     ),
-    lager:info("*** Local POC Result ~p", [LocalPOC]),
-    case LocalPOC of
-        {error, _} ->
-            %% if the POC does not exist it could be it hasnt yet been initialized
-            %% so check if we have a cached POC key. these are added at the point
-            %% a block is proposed and then before the block has been gossiped
-            %% if such a key exists its a strong indication its not yet initialized
-            %% clients should retry after a period of time
-            case cached_poc_key(OnionKeyHash) of
-                {ok, {_KeyHash, _POCData}} ->
-                    {error, <<"queued_poc">>};
-                _ ->
-                    {error, <<"invalid_or_expired_poc">>}
-            end;
-        {ok, #local_poc{block_hash = BlockHash, target = Challengee, onion = Onion}} ->
-            {true, Onion};
-        {ok, #local_poc{block_hash = BlockHash, target = _OtherTarget}} ->
-            false;
-        {ok, #local_poc{block_hash = _OtherBlockHash, target = _Target}} ->
-            {error, mismatched_block_hash}
-    end.
+    lager:info("*** e2qc local POC check target result ~p", [LocalPOC]),
+    Res =
+        case LocalPOC of
+            {error, not_found} ->
+                %% if the cache returns not found it could be it hasnt yet been initialized
+                %% so check if we have a cached POC key. these are added at the point
+                %% a block is proposed and then before the block has been gossiped
+                %% if such a key exists its a strong indication its not yet initialized
+                %% OR the e2qc cache was called before the POC was initialised and it
+                %% has cached the {error, not_found} term
+                %% so if we have the key then check rocks again,
+                %% if still not available then its likely the POC hasnt been initialized
+                %% if found then invalidate the e2qc cache
+                case cached_poc_key(OnionKeyHash) of
+                    {ok, {_KeyHash, _POCData}} ->
+                        %% we do know this key
+                        lager:info("*** ~p is a known key ~p", [OnionKeyHash]),
+                        case ?MODULE:local_poc(OnionKeyHash) of
+                            {error, _} ->
+                                %% clients should retry after a period of time
+                                {error, <<"queued_poc">>};
+                            {ok, #local_poc{block_hash = BlockHash, target = Challengee, onion = Onion}} ->
+                                e2qc:evict(local_pocs, OnionKeyHash),
+                                {true, Onion};
+                            {ok, #local_poc{block_hash = BlockHash, target = _OtherTarget}} ->
+                                e2qc:evict(local_pocs, OnionKeyHash),
+                                false;
+                            {ok, #local_poc{block_hash = _OtherBlockHash, target = _Target}} ->
+                                e2qc:evict(local_pocs, OnionKeyHash),
+                                {error, mismatched_block_hash}
+                        end;
+                    _ ->
+                        lager:info("*** ~p is NOT a known key", [OnionKeyHash]),
+                        {error, <<"invalid_or_expired_poc">>}
+                end;
+            {ok, #local_poc{block_hash = BlockHash, target = Challengee, onion = Onion}} ->
+                {true, Onion};
+            {ok, #local_poc{block_hash = BlockHash, target = _OtherTarget}} ->
+                false;
+            {ok, #local_poc{block_hash = _OtherBlockHash, target = _Target}} ->
+                {error, mismatched_block_hash};
+            _ ->
+                false
+        end,
+    lager:info("*** check target result for key ~p: ~p", [OnionKeyHash, Res]),
+    Res.
 
 -spec report(
     Report :: {witness, blockchain_poc_witness_v1:poc_witness()} | {receipt, blockchain_poc_receipt_v1:receipt()},
@@ -212,6 +235,24 @@ check_target(Challengee, BlockHash, OnionKeyHash) ->
     P2PAddr :: libp2p_crypto:peer_id()) -> ok.
 report(Report, OnionKeyHash, Peer, P2PAddr) ->
     gen_server:cast(?MODULE, {Report, OnionKeyHash, Peer, P2PAddr}).
+
+-spec local_poc(OnionKeyHash :: binary()) ->
+    {ok, local_poc()} | {error, any()}.
+local_poc(OnionKeyHash) ->
+    case persistent_term:get(?POC_DB_CF, not_found) of
+        not_found -> {error, not_found};
+        {DB, CF} ->
+            case rocksdb:get(DB, CF, OnionKeyHash, []) of
+                {ok, Bin} ->
+                    [POC] = erlang:binary_to_term(Bin),
+                    {ok, POC};
+                not_found ->
+                    {error, not_found};
+                Error ->
+                    lager:error("error: ~p", [Error]),
+                    Error
+            end
+    end.
 
 %% ------------------------------------------------------------------
 %% gen_server functions
@@ -223,6 +264,7 @@ init(_Args) ->
     SelfPubKeyBin = libp2p_crypto:pubkey_to_bin(PubKey),
     DB = miner_poc_mgr_db_owner:db(),
     CF = miner_poc_mgr_db_owner:poc_mgr_cf(),
+    ok = persistent_term:put(?POC_DB_CF, {DB, CF}),
     {ok, #state{
         db = DB,
         cf = CF,
@@ -230,10 +272,6 @@ init(_Args) ->
         pub_key = SelfPubKeyBin
     }}.
 
-handle_call({local_poc, OnionKeyHash}, _From, State) ->
-    lager:info("reading local_poc from DB for key ~p",[OnionKeyHash]),
-    Res = get_local_poc(OnionKeyHash, State),
-    {reply, Res, State};
 handle_call({active_pocs}, _From, State = #state{}) ->
     {reply, local_pocs(State), State};
 handle_call(_Request, _From, State = #state{}) ->
@@ -259,14 +297,20 @@ handle_info(init, #state{chain = undefined} = State) ->
             SelfPubKeyBin = blockchain_swarm:pubkey_bin(),
             POCTimeout =
                 case blockchain:config(?poc_timeout, Ledger) of
-                    {ok, V} -> V;
+                    {ok, T1} -> T1;
                     _ -> ?POC_TIMEOUT
+                end,
+            POCReceiptsAborbTimeout =
+                case blockchain:config(?poc_receipts_absorb_timeout, Ledger) of
+                    {ok, T2} -> T2;
+                    _ -> ?POC_RECEIPTS_ABSORB_TIMEOUT
                 end,
             {noreply, State#state{
                 chain = Chain,
                 ledger = Ledger,
                 pub_key = SelfPubKeyBin,
-                poc_timeout = POCTimeout
+                poc_timeout = POCTimeout,
+                poc_receipts_absorb_timeout = POCReceiptsAborbTimeout
             }}
     end;
 handle_info(init, State) ->
@@ -299,6 +343,7 @@ handle_info(_Info, State = #state{}) ->
     {noreply, State}.
 
 terminate(_Reason, _State = #state{}) ->
+    persistent_term:erase(?POC_DB_CF),
     ok.
 
 %%%===================================================================
@@ -322,14 +367,10 @@ handle_add_block_event(POCChallengeType, BlockHash, Chain, State) when POCChalle
             ok = purge_local_pocs(Block, State),
             BlockHeight = blockchain_block:height(Block),
             %% GC local pocs keys every 50 blocks
+            %% NOTE, we dont need to GC the public POCs on the ledger here
+            %% that GC is handled elsewhere via blockchain_ledger_v1:maybe_gc_pocs/2
             case BlockHeight rem 50 == 0 of
                 true -> ok = purge_pocs_keys(Block, State);
-                false -> ok
-            end,
-            %% GC public pocs every 100 blocks
-            %% GC is also run on a public poc when the receipt txn is absorbed
-            case BlockHeight rem 100 == 0 of
-                true -> ok = purge_public_pocs(Block, State);
                 false -> ok
             end;
         _ ->
@@ -355,7 +396,7 @@ handle_witness(Witness, OnionKeyHash, Peer, #state{chain = Chain} = State) ->
             {noreply, State};
         true ->
             %% get the local POC
-            case get_local_poc(OnionKeyHash, State) of
+            case ?MODULE:local_poc(OnionKeyHash) of
                 {error, _} ->
                     {noreply, State};
                 {ok, #local_poc{packet_hashes = PacketHashes, responses = Response0} = POC} ->
@@ -422,7 +463,7 @@ handle_receipt(Receipt, OnionKeyHash, Peer, PeerAddr, #state{chain = Chain} = St
             {noreply, State};
         true ->
             %% get the POC data from the cache
-            case get_local_poc(OnionKeyHash, State) of
+            case ?MODULE:local_poc(OnionKeyHash) of
                 {error, _} ->
                     {noreply, State};
                 {ok, #local_poc{challengees = Challengees, responses = Response0} = POC} ->
@@ -524,7 +565,7 @@ initialize_poc(BlockHash, POCStartHeight, Keys, Vars, #state{chain = Chain, pub_
                 N + 1
             ),
             OnionList = lists:zip([libp2p_crypto:bin_to_pubkey(P) || P <- Path], LayerData),
-            {Onion, Layers} = blockchain_poc_packet:build(Keys, IV, OnionList, BlockHash, <<"ignore_ledger">>),
+            {Onion, Layers} = blockchain_poc_packet_v2:build(Keys, IV, OnionList),
             [_|LayerHashes] = [crypto:hash(sha256, L) || L <- Layers],
             Challengees = lists:zip(Path, LayerData),
             PacketHashes = lists:zip(Path, LayerHashes),
@@ -614,45 +655,6 @@ purge_local_pocs(
     ),
     ok.
 
--spec purge_public_pocs(
-    Block :: blockchain_block:block(),
-    State :: state()
-) -> ok.
-purge_public_pocs(
-    Block,
-    #state{chain = Chain, poc_timeout = POCTimeout} = _State
-) ->
-    %% iterate and GC the public pocs on the ledger
-    %% a public poc is a representation of the data
-    %% included in a block as part of poc metadata
-    %% we need to keep it available on the ledger
-    %% until after the assocaited receipt v2 txn has
-    %% has been absorbed or would have been expected
-    %% expected to be aborbed
-    Ledger = blockchain:ledger(Chain),
-    BlockHeight = blockchain_block:height(Block),
-    %% iterate over the public POCs, delete any which are beyond the lifespan of when the active POC would have ended
-    PublicPOCs = blockchain_ledger_v1:active_public_pocs(Ledger),
-    lists:foreach(
-        fun(PublicPOC) ->
-            POCHeight = blockchain_ledger_poc_v3:start_height(PublicPOC),
-            OnionKeyHash = blockchain_ledger_poc_v3:onion_key_hash(PublicPOC),
-            %% the public poc data is required by the receipts v2 txn absorb
-            %% the public poc will be GCed as part of that absorb
-            %% but in case that fails we will GC it here after giving
-            %% the txn N blocks to be absorbed
-            case (BlockHeight - POCHeight) > (POCTimeout + ?POC_RECEIPTS_ABSORB_TIMEOUT) of
-                true ->
-                    %% the lifespan of any POC for this key has passed, we can GC
-                    ok = blockchain_ledger_v1:delete_public_poc(OnionKeyHash, Ledger);
-                _ ->
-                    ok
-            end
-        end,
-        PublicPOCs
-    ),
-    ok.
-
 -spec purge_pocs_keys(
     Block :: blockchain_block:block(),
     State :: state()
@@ -662,7 +664,7 @@ purge_pocs_keys(
     #state{poc_timeout = POCTimeout} = _State
 ) ->
     %% iterate over the poc keys in our ets cache
-    %% these are the a copy of the keys generated by this node
+    %% these are a copy of the keys generated by this node
     %% as part of its block creation ( whilst it is in the CG)
     %% and submitted as part of the block metadata
     %% one or more of these keys *may* make it into the block
@@ -935,25 +937,11 @@ update_addr_hash(Bloom, Element) ->
 %% ------------------------------------------------------------------
 %% DB functions
 %% ------------------------------------------------------------------
--spec get_local_poc(OnionKeyHash :: binary(),
-                    State :: state()) ->
-    {ok, local_poc()} | {error, any()}.
-get_local_poc(OnionKeyHash, #state{db=DB, cf=CF}) ->
-    case rocksdb:get(DB, CF, OnionKeyHash, []) of
-        {ok, Bin} ->
-            [POC] = erlang:binary_to_term(Bin),
-            {ok, POC};
-        not_found ->
-            {error, not_found};
-        Error ->
-            lager:error("error: ~p", [Error]),
-            Error
-    end.
 
 %%-spec append_local_poc(NewLocalPOC :: local_poc(),
 %%                       State :: state()) -> ok | {error, any()}.
 %%append_local_poc(#local_poc{onion_key_hash=OnionKeyHash} = NewLocalPOC, #state{db=DB, cf=CF}=State) ->
-%%    case get_local_poc(OnionKeyHash, State) of
+%%    case ?MODULE:local_poc(OnionKeyHash) of
 %%        {ok, SavedLocalPOCs} ->
 %%            %% check we're not writing something we already have
 %%            case lists:member(NewLocalPOC, SavedLocalPOCs) of

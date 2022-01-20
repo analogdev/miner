@@ -126,13 +126,15 @@ handle_msg({data, _Msg}, StreamState) ->
     lager:info("grpc client received unexpected msg ~p",[_Msg]),
     StreamState.
 
-handle_info({retry_check_target, Attempt, Msg}, StreamState)  when Attempt < 3 ->
+handle_info({retry_check_target, Attempt, Msg}, StreamState)  when Attempt =< 3 ->
     lager:warning("retry_check_target with attempt ~p for msg: ~p", [Attempt, Msg]),
     {data, #gateway_resp_v1_pb{msg = {poc_challenge_resp, ChallengeNotification}, height = NotificationHeight, signature = ChallengerSig}} = Msg,
     #gateway_poc_challenge_notification_resp_v1_pb{challenger = #routing_address_pb{uri = URI, pub_key = PubKeyBin}, block_hash = BlockHash, onion_key_hash = OnionKeyHash} = ChallengeNotification,
     Self = self(),
     F = fun()->
-            case miner_poc_grpc_client_statem:check_target(binary_to_list(URI), PubKeyBin, OnionKeyHash, BlockHash, NotificationHeight, ChallengerSig) of
+            TargetRes = miner_poc_grpc_client_statem:check_target(binary_to_list(URI), PubKeyBin, OnionKeyHash, BlockHash, NotificationHeight, ChallengerSig),
+            lager:info("check target result for key ~p: ~p",[OnionKeyHash, TargetRes]),
+            case TargetRes of
                 {ok, Result, _Details} ->
                     handle_check_target_resp(Result);
                 {error, <<"queued_poc">>} ->
